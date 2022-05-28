@@ -1,0 +1,9 @@
+{
+  "name": "@scaled/scaled",
+  "version": "0.0.1",
+  "type": "commonjs",
+  "dependencies": {
+    "@thehubbleproject/bls": "^0.5.1",
+    "ethers": "^5.6.8"
+  }
+}
