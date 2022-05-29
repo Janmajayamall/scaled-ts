@@ -1,4 +1,4 @@
-import { BigNumber, Contract, Signer, utils } from 'ethers';
+import { BigNumber, Signer, utils } from 'ethers';
 import { solG1 } from '@thehubbleproject/bls/dist/mcl';
 import {
   aggregate,
@@ -7,9 +7,15 @@ import {
 } from '@thehubbleproject/bls/dist/signer';
 import {
   Provider,
-  TransactionRequest,
   TransactionResponse,
 } from '@ethersproject/abstract-provider';
+import {
+  Erc20__factory,
+  Router,
+  Router__factory,
+  StateBLS,
+  StateBLS__factory,
+} from 'packages/scaled/types/ethers-contracts';
 
 interface Receipt {
   aIndex: BigNumber;
@@ -25,18 +31,9 @@ interface Update {
   bSignature: solG1;
 }
 
-const StateAbi = [
-  'function post() external',
-  'function register(address userAddress, uint256[4] calldata blsPk, uint256[2] calldata sk) external',
-];
-
-const RouterAbi = [
-  'function fundAccount(uint64 toIndex, uint128 amount) external',
-];
-
 export class Scaled {
-  public stateBLS: Contract;
-  public router: Contract;
+  public stateBLS: StateBLS;
+  public router: Router;
 
   public signer: Signer;
   public provider: Provider;
@@ -49,55 +46,81 @@ export class Scaled {
     stateBLSAddress: string,
     routerAddress: string
   ) {
-    this.stateBLS = new Contract(
-      stateBLSAddress,
-      StateAbi,
-      signer.connect(provider)
-    );
+    signer.connect(provider);
 
-    this.router = new Contract(
-      routerAddress,
-      RouterAbi,
-      signer.connect(provider)
-    );
+    this.stateBLS = StateBLS__factory.connect(stateBLSAddress, signer);
+    this.router = Router__factory.connect(routerAddress, signer);
 
     this.signer = signer;
     this.provider = provider;
     this.blsSigner = blsSigner;
+  }
 
-    signer.connect(provider);
+  /// Router related functions
+  public async giveRouterApproval(
+    amount: BigNumber
+  ): Promise<TransactionResponse> {
+    const token = Erc20__factory.connect(await this.getToken(), this.signer);
+    return token.approve(this.router.address, amount);
+  }
+
+  /// StateBLS related functions
+  public async getToken(): Promise<string> {
+    return this.stateBLS.token();
+  }
+
+  public async getAccount(userIndex: BigNumber): Promise<{
+    balance: BigNumber;
+    nonce: number;
+    postNonce: number;
+  }> {
+    return this.stateBLS.accounts(userIndex);
   }
 
   public async register(): Promise<TransactionResponse> {
     let address = await this.signer.getAddress();
 
-    const txReq = await this.stateBLS['register'](
-      await this.signer.getAddress,
+    return this.stateBLS.register(
+      address,
       this.blsSigner.pubkey,
       this.blsSigner.sign(utils.solidityPack(['address'], [address]))
     );
-
-    return await txReq.wait();
   }
 
-  public async fundAccount(amount: BigNumber): Promise<TransactionRequest> {
-    // TODO validate amount
-
-    return await this.router['fundAccount'](amount);
+  // TODO: Token approval to router contract
+  public async fundAccount(
+    userIndex: BigNumber,
+    amount: BigNumber
+  ): Promise<TransactionResponse> {
+    return this.router.fundAccount(userIndex, amount);
   }
 
-  public async depositSecurity(amount: BigNumber): Promise<TransactionRequest> {
-    return await this.router['fundAccount'](amount);
+  public async depositSecurity(
+    userIndex: BigNumber,
+    amount: BigNumber
+  ): Promise<TransactionResponse> {
+    return await this.router.depositSecurity(userIndex, amount);
   }
 
-  public withdrawAmount() {}
+  public async initWithdraw(
+    userIndex: BigNumber,
+    amount: BigNumber
+  ): Promise<TransactionResponse> {
+    let acc = await this.getAccount(userIndex);
 
-  public correctUpdate() {}
+    let signature = this.blsSigner.sign(
+      utils.solidityPack(['uint32', 'uint128'], [acc.nonce + 1, amount])
+    );
 
-  /**
-   * post
-   * Post signed receipts shared with `signer` as `a`
-   */
+    return this.stateBLS.initWithdraw(userIndex, amount, signature);
+  }
+
+  public async processWithdrawal(
+    userIndex: BigNumber
+  ): Promise<TransactionResponse> {
+    return this.stateBLS.processWithdrawal(userIndex);
+  }
+
   public async post(
     aIndex: BigNumber,
     updates: Update[]
@@ -111,7 +134,7 @@ export class Scaled {
     let aggSig = aggregate(sigs);
 
     let calldata = new Uint8Array([
-      // index of `a` is 1
+      ...utils.arrayify(this.stateBLS.interface.getSighash('post()')),
       ...utils.arrayify(utils.solidityPack(['uint64'], [aIndex])),
       ...utils.arrayify(utils.solidityPack(['uint16'], [updates.length])),
       ...utils.arrayify(
@@ -134,11 +157,6 @@ export class Scaled {
         ),
       ]);
     });
-
-    calldata = new Uint8Array([
-      ...utils.arrayify(this.stateBLS.interface.getSighash('post()')),
-      ...calldata,
-    ]);
 
     return await this.signer.sendTransaction(
       await this.signer.populateTransaction({
